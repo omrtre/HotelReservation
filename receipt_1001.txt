@@ -1,0 +1,12 @@
+Ophelia's Oasis Hotel
+-------------------------
+Bill ID: 1001
+Bill Issue Date: 2025-10-25
+Guest Name: Ava Thompson
+Room Number: 205
+Arrival Date: 2025-10-15
+Departure Date: 2025-10-20
+Nights Stayed: 5
+Reservation Type: Conventional
+Total Amount: $750.00
+-------------------------
