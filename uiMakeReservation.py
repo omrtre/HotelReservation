@@ -8,7 +8,7 @@ TODAY = dt.date.today
 ISO = dt.date.fromisoformat
 RATE_MULT = {"Prepaid": 0.75, "60-Day": 0.85, "Conventional": 1.00, "Incentive": 0.80}
 ROOM_TYPES = ["Standard", "Deluxe", "Suite", "Penthouse"]
-STATUSES = ["Booked", "In-House", "Checked-out", "Cancelled"]
+STATUSES = ["Booked", "In-House", "Checked-out", "Cancelled", "Chaging data"]
 
 def load_state():
     if not os.path.exists(DATA_FILE):
