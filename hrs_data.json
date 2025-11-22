@@ -41,7 +41,30 @@
       },
       "assigned_room": "303",
       "status": "Booked"
+    },
+    {
+      "locator": "OO4002",
+      "guest_name": "t",
+      "email": "taharisyouri12@gmail.com",
+      "phone": "9199310292",
+      "arrive": "2025-11-24",
+      "depart": "2025-11-27",
+      "rtype": "Conventional",
+      "room_type": "Suite",
+      "cc_on_file": true,
+      "paid_advance": 0.0,
+      "paid_advance_date": "",
+      "total_locked": 900.0,
+      "snapshot": {
+        "nightly": {
+          "2025-11-24": 300.0,
+          "2025-11-25": 300.0,
+          "2025-11-26": 300.0
+        }
+      },
+      "assigned_room": "",
+      "status": "In-House"
     }
   ],
-  "last_locator": 4001
+  "last_locator": 4002
 }
