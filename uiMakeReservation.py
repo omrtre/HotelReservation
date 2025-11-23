@@ -8,7 +8,7 @@ TODAY = dt.date.today
 ISO = dt.date.fromisoformat
 RATE_MULT = {"Prepaid": 0.75, "60-Day": 0.85, "Conventional": 1.00, "Incentive": 0.80}
 ROOM_TYPES = ["Standard", "Deluxe", "Suite", "Penthouse"]
-STATUSES = ["Booked", "In-House", "Checked-out", "Cancelled", "Changing date"]
+STATUSES = ["Booked", "In-House", "Checked-out", "Cancelled", "Changing dates"]
 
 # ---------- Data helpers ----------
 def load_state():
