@@ -8,15 +8,21 @@ TODAY = dt.date.today
 ISO = dt.date.fromisoformat
 RATE_MULT = {"Prepaid": 0.75, "60-Day": 0.85, "Conventional": 1.00, "Incentive": 0.80}
 ROOM_TYPES = ["Standard", "Deluxe", "Suite", "Penthouse"]
-STATUSES = ["Booked", "In-House", "Checked-out", "Cancelled", "Changing data"]
+STATUSES = ["Booked", "In-House", "Checked-out", "Cancelled", "Changing date"]
 
+# ---------- Data helpers ----------
 def load_state():
     if not os.path.exists(DATA_FILE):
-        return {"base_rates": {}, "reservations": [], "last_locator": 4000}
-    with open(DATA_FILE) as f: return json.load(f)
+        return {"base_rates": {}, "reservations": [], "last_locator": 4000, "payment_reminders_sent": {}}
+    with open(DATA_FILE) as f:
+        data = json.load(f)
+        if "payment_reminders_sent" not in data:
+            data["payment_reminders_sent"] = {}
+        return data
 
 def save_state(state):
-    with open(DATA_FILE, "w") as f: json.dump(state, f, indent=2)
+    with open(DATA_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 def daterange(start, end):
     while start < end:
@@ -35,21 +41,76 @@ def occ_ratio(state, start, end):
     ]
     return (sum(nightly)/len(nightly))/ROOM_COUNT if nightly else 0.0
 
-def quote_total(state, arrive, depart, rtype):
+def quote_total(state, arrive, depart, rtype, original_cost=0, is_change=False):
     start, end = ISO(arrive), ISO(depart)
-    if end <= start: raise ValueError("Departure must be after arrival.")
+    if end <= start:
+        raise ValueError("Departure must be after arrival.")
+    
     occ = occ_ratio(state, start, end)
     eligible = (start - TODAY()).days <= 30 and occ <= 0.60
     mult = RATE_MULT.get(rtype, 1.0)
     if rtype == "Incentive" and not eligible:
         mult = 1.0
+    
     nightly = {d.isoformat(): round(base_rate(state, d) * mult, 2) for d in daterange(start, end)}
-    return round(sum(nightly.values()), 2), nightly, eligible, occ
+    total = round(sum(nightly.values()), 2)
+    
+    # Apply date-change penalty only for Prepaid and 60-Day
+    change_note = ""
+    if is_change and rtype in ["Prepaid", "60-Day"]:
+        change_cost = round(total * 1.10 - original_cost, 2)
+        # No refund if changed reservation costs less
+        adjusted_total = max(original_cost, change_cost) if change_cost > 0 else original_cost
+        change_note = f"Change policy: 110% of new rate - original cost = ${total*1.10:,.2f} - ${original_cost:,.2f} = ${change_cost:,.2f}; Adjusted total = ${adjusted_total:,.2f}"
+        total = adjusted_total
+    
+    return total, nightly, eligible, occ, change_note
 
 def next_locator(state):
     state["last_locator"] += 1
     return f"OO{state['last_locator']}"
 
+def run_daily_tasks(state):
+    """Run automated daily tasks: payment reminders and no-show penalties"""
+    today = TODAY()
+    tasks_performed = []
+    
+    # 1. Payment reminders for 60-day reservations (45 days before stay)
+    for res in state["reservations"]:
+        if res.get("status") == "Booked" and res.get("rtype") == "60-Day":
+            arrive_date = ISO(res["arrive"])
+            days_until_arrival = (arrive_date - today).days
+            if days_until_arrival == 45:
+                locator = res.get("locator", "Unknown")
+                state["payment_reminders_sent"][locator] = today.isoformat()
+                tasks_performed.append(f"Payment reminder sent for reservation {locator}")
+    
+    # 2. No-show penalties for guests who didn't check in yesterday
+    yesterday = today - dt.timedelta(days=1)
+    for res in state["reservations"]:
+        if (res.get("status") == "Booked" and 
+            ISO(res["arrive"]) == yesterday and
+            not res.get("checked_in", False)):
+            first_night_cost = list(res.get("snapshot", {}).get("nightly", {}).values())[0] if res.get("snapshot", {}).get("nightly") else base_rate(state, yesterday)
+            res["no_show_penalty"] = first_night_cost
+            res["status"] = "Cancelled"
+            res["cancellation_reason"] = "No-show"
+            tasks_performed.append(f"No-show penalty applied to reservation {res.get('locator', 'Unknown')}: ${first_night_cost:.2f}")
+    
+    if tasks_performed:
+        save_state(state)
+    return tasks_performed
+
+def mask_card(card_number: str) -> str:
+    """Return masked card number showing only last 4 digits."""
+    if not card_number or len(card_number) < 4:
+        return "****"
+    digits = "".join(ch for ch in card_number if ch.isdigit())
+    if len(digits) < 4:
+        return "****"
+    return "*" * (len(digits) - 4) + digits[-4:]
+
+# ---------- Main app ----------
 class ReservationApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -73,8 +134,10 @@ class ReservationApp(tk.Tk):
         self.room_type = tk.StringVar(value=ROOM_TYPES[0])
         self.status = tk.StringVar(value="Booked")
         self.nights_str = tk.StringVar(value="—")
-        self.assigned_room = tk.StringVar(value="")  # form value (optional)
+        self.assigned_room = tk.StringVar(value="")
+        self.cc_info = tk.StringVar()
         self.last_quote = None
+        self.selected_reservation = None
 
         # ------------- Layout: left form / right browser -------------
         root = ttk.Frame(self, padding=10)
@@ -83,9 +146,14 @@ class ReservationApp(tk.Tk):
         root.columnconfigure(1, weight=1)
         root.rowconfigure(1, weight=1)
 
-        # Title
-        title = ttk.Label(root, text="Reservation — Create & Browse", font=("Segoe UI", 16, "bold"))
-        title.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0,6))
+        # Title and Daily Tasks Button
+        title_frame = ttk.Frame(root)
+        title_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,6))
+        title_frame.columnconfigure(0, weight=1)
+        
+        title = ttk.Label(title_frame, text="Reservation — Create & Browse", font=("Segoe UI", 16, "bold"))
+        title.grid(row=0, column=0, sticky="w")
+        ttk.Button(title_frame, text="Run Daily Tasks", command=self.run_daily_tasks_ui).grid(row=0, column=1, sticky="e")
 
         # LEFT: Create/Quote form
         form = ttk.LabelFrame(root, text="Create / Quote Reservation")
@@ -107,11 +175,12 @@ class ReservationApp(tk.Tk):
         row("Departure (YYYY-MM-DD)", self.dep, 16)
 
         ttk.Label(form, text="Reservation Type").grid(row=r, column=0, sticky="w", pady=2)
-        ttk.Combobox(
+        self.rtype_combo = ttk.Combobox(
             form, textvariable=self.rtype,
             values=["Prepaid", "60-Day", "Conventional", "Incentive"],
             state="readonly", width=16
-        ).grid(row=r, column=1, sticky="w", pady=2); r += 1
+        )
+        self.rtype_combo.grid(row=r, column=1, sticky="w", pady=2); r += 1
 
         ttk.Label(form, text="Room Type").grid(row=r, column=0, sticky="w", pady=2)
         ttk.Combobox(
@@ -132,6 +201,10 @@ class ReservationApp(tk.Tk):
         ttk.Label(form, text="Assigned Room # (opt)").grid(row=r, column=0, sticky="w", pady=2)
         ttk.Entry(form, textvariable=self.assigned_room, width=10).grid(row=r, column=1, sticky="w", pady=2); r += 1
 
+        # Credit card info (required)
+        ttk.Label(form, text="Credit Card (16 digits — required)").grid(row=r, column=0, sticky="w", pady=2)
+        ttk.Entry(form, textvariable=self.cc_info, width=20).grid(row=r, column=1, sticky="w", pady=2); r += 1
+
         # Quote controls
         ttk.Button(form, text="Quote", command=self.on_quote).grid(row=r, column=0, pady=(6,4), sticky="w")
         self.lbl_quote = ttk.Label(form, text="Total: —  | Incentive eligible: —  | Avg occupancy: —%")
@@ -147,7 +220,6 @@ class ReservationApp(tk.Tk):
 
         # Save
         ttk.Button(form, text="Confirm & Save", command=self.on_save).grid(row=r, column=1, sticky="e", pady=(4,0))
-
         form.rowconfigure(r-1, weight=1)
 
         # RIGHT: Reservations Browser
@@ -166,10 +238,10 @@ class ReservationApp(tk.Tk):
         ttk.Entry(tb, textvariable=self.search_var, width=18).pack(side="left")
         ttk.Button(tb, text="Find", command=self.refresh_res_list).pack(side="left", padx=4)
 
-        # Table
-        self.res_cols = ("Locator","Guest","Arrive","Depart","Nights","Room Type","Res Type","Status","Room#")
+        # Table with Card (Last 4)
+        self.res_cols = ("Locator","Guest","Arrive","Depart","Nights","Room Type","Res Type","Status","Room#","Paid","Card (Last 4)")
         self.res_tree = ttk.Treeview(right, columns=self.res_cols, show="headings", height=12)
-        widths = [80, 140, 90, 90, 60, 100, 100, 90, 60]
+        widths = [80, 140, 90, 90, 60, 100, 100, 90, 60, 60, 110]
         for c, w in zip(self.res_cols, widths):
             self.res_tree.heading(c, text=c)
             self.res_tree.column(c, width=w, anchor="center")
@@ -181,23 +253,68 @@ class ReservationApp(tk.Tk):
 
         self.res_tree.bind("<<TreeviewSelect>>", self.on_select_res)
 
-        # Details + quick update
-        details = ttk.Frame(right)
-        details.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        # Date Change Box
+        date_change_frame = ttk.LabelFrame(right, text="Change Dates", padding=8)
+        date_change_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6,4))
+        date_change_frame.columnconfigure(1, weight=1)
+        date_change_frame.columnconfigure(3, weight=1)
+
+        # Current dates row
+        ttk.Label(date_change_frame, text="Current Arrival:", font=("", 9, "bold")).grid(row=0, column=0, sticky="w", pady=2)
+        self.curr_arr_label = ttk.Label(date_change_frame, text="—", foreground="blue", font=("", 9, "bold"))
+        self.curr_arr_label.grid(row=0, column=1, sticky="w", pady=2, padx=(4,20))
+        
+        ttk.Label(date_change_frame, text="Current Departure:", font=("", 9, "bold")).grid(row=0, column=2, sticky="w", pady=2)
+        self.curr_dep_label = ttk.Label(date_change_frame, text="—", foreground="blue", font=("", 9, "bold"))
+        self.curr_dep_label.grid(row=0, column=3, sticky="w", pady=2, padx=(4,0))
+
+        # New dates row
+        ttk.Label(date_change_frame, text="New Arrival:", font=("", 9, "bold")).grid(row=1, column=0, sticky="w", pady=2)
+        self.d_new_arr = tk.StringVar()
+        ttk.Entry(date_change_frame, textvariable=self.d_new_arr, width=12).grid(row=1, column=1, sticky="w", pady=2, padx=(4,20))
+        
+        ttk.Label(date_change_frame, text="New Departure:", font=("", 9, "bold")).grid(row=1, column=2, sticky="w", pady=2)
+        self.d_new_dep = tk.StringVar()
+        ttk.Entry(date_change_frame, textvariable=self.d_new_dep, width=12).grid(row=1, column=3, sticky="w", pady=2, padx=(4,0))
+
+        # Buttons row
+        btn_frame = ttk.Frame(date_change_frame)
+        btn_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6,0))
+        ttk.Button(btn_frame, text="Quote Date Change", command=self.quote_date_change).pack(side="left", padx=(0,8))
+        ttk.Button(btn_frame, text="Apply Date Change", command=self.apply_date_change).pack(side="left")
+
+        # Payment and Cancellation Section
+        payment_frame = ttk.LabelFrame(right, text="Payment & Cancellation", padding=6)
+        payment_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4,0))
+        ttk.Button(payment_frame, text="Process Prepayment", command=self.process_prepayment).pack(side="left", padx=(0,8))
+        ttk.Button(payment_frame, text="Process Payment", command=self.process_payment).pack(side="left", padx=(0,8))
+        ttk.Button(payment_frame, text="Generate Bill", command=self.generate_bill).pack(side="left", padx=(0,8))
+        ttk.Button(payment_frame, text="Cancel Reservation", command=self.cancel_reservation).pack(side="left", padx=(0,8))
+        ttk.Button(payment_frame, text="Check In Guest", command=self.check_in_guest).pack(side="left", padx=(0,8))
+        ttk.Button(payment_frame, text="Check Out Guest", command=self.check_out_guest).pack(side="left")
+
+        # Details section
+        details = ttk.LabelFrame(right, text="Reservation Details")
+        details.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4,0))
         details.columnconfigure(1, weight=1)
-        self.d_lbl = ttk.Label(details, text="Select a reservation to see details.", anchor="w")
-        self.d_lbl.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0,4))
+        
+        self.d_lbl = ttk.Label(details, text="Select a reservation to see details.", anchor="w", wraplength=700)
+        self.d_lbl.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(4,6))
 
-        ttk.Label(details, text="Status").grid(row=1, column=0, sticky="w")
+        # Status and Room controls
+        control_frame = ttk.Frame(details)
+        control_frame.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(0,4))
+        
+        ttk.Label(control_frame, text="Status:").pack(side="left", padx=(0,4))
         self.d_status = tk.StringVar(value="Booked")
-        ttk.Combobox(details, textvariable=self.d_status, values=STATUSES, state="readonly", width=14)\
-            .grid(row=1, column=1, sticky="w", padx=(4,12))
-
-        ttk.Label(details, text="Room #").grid(row=1, column=2, sticky="w")
+        ttk.Combobox(control_frame, textvariable=self.d_status, values=STATUSES, state="readonly", width=14)\
+            .pack(side="left", padx=(0,20))
+            
+        ttk.Label(control_frame, text="Room #:").pack(side="left", padx=(0,4))
         self.d_room = tk.StringVar()
-        ttk.Entry(details, textvariable=self.d_room, width=8).grid(row=1, column=3, sticky="w", padx=(4,0))
-
-        ttk.Button(details, text="Update Selected", command=self.update_selected).grid(row=1, column=4, padx=8)
+        ttk.Entry(control_frame, textvariable=self.d_room, width=8).pack(side="left", padx=(0,20))
+        
+        ttk.Button(control_frame, text="Update Selected", command=self.update_selected).pack(side="left")
 
         # Init populate
         self.refresh_res_list()
@@ -221,7 +338,7 @@ class ReservationApp(tk.Tk):
     # ---------- Form actions ----------
     def on_quote(self):
         try:
-            total, nightly, eligible, occ = quote_total(self.state_data, self.arr.get(), self.dep.get(), self.rtype.get())
+            total, nightly, eligible, occ, _ = quote_total(self.state_data, self.arr.get(), self.dep.get(), self.rtype.get(), original_cost=0, is_change=False)
         except Exception as e:
             messagebox.showerror("Quote error", str(e)); return
 
@@ -230,7 +347,6 @@ class ReservationApp(tk.Tk):
         for d, amt in nightly.items(): self.tree.insert("", "end", values=(d, f"${amt:,.2f}"))
         self.last_quote = (total, nightly, eligible, occ)
 
-        # Also update nights label if possible
         n = self._calc_nights()
         if n is not None and n >= 0:
             self.nights_str.set(str(n))
@@ -241,9 +357,20 @@ class ReservationApp(tk.Tk):
         if not self.guest.get().strip():
             return messagebox.showwarning("Save", "Guest name is required.")
 
+        # Credit card validation (required, 16 digits)
+        card = self.cc_info.get().strip()
+        if not card or len(card) != 16 or not card.isdigit():
+            return messagebox.showerror("Credit Card", "A valid 16-digit credit card number is required.")
+
         total, nightly, *_ = self.last_quote
         loc = next_locator(self.state_data)
-        adv = total if self.rtype.get() in ("Prepaid", "60-Day") else 0.0
+        rtype = self.rtype.get()
+        
+        # Determine advance payment based on reservation type
+        if rtype == "Prepaid":
+            adv = total
+        else:
+            adv = 0.0
 
         self.state_data["reservations"].append({
             "locator": loc,
@@ -252,8 +379,9 @@ class ReservationApp(tk.Tk):
             "phone": self.phone.get().strip(),
             "arrive": self.arr.get(),
             "depart": self.dep.get(),
-            "rtype": self.rtype.get(),
+            "rtype": rtype,
             "room_type": self.room_type.get(),
+            "cc_info": card,
             "cc_on_file": True,
             "paid_advance": round(adv, 2),
             "paid_advance_date": TODAY().isoformat() if adv else "",
@@ -261,16 +389,20 @@ class ReservationApp(tk.Tk):
             "snapshot": {"nightly": nightly},
             "assigned_room": self.assigned_room.get().strip(),
             "status": self.status.get(),
+            "checked_in": False,
+            "checked_out": False,
+            "fully_paid": True if rtype == "Prepaid" else False,
+            "no_show_penalty": 0.0,
+            "change_note": "",
+            "created_date": TODAY().isoformat()
         })
         save_state(self.state_data)
-        messagebox.showinfo("Saved", f"Reservation saved.\nLocator: {loc}")
+        messagebox.showinfo("Saved", f"Reservation saved.\nLocator: {loc}" + (f"\nAdvance paid: ${adv:,.2f}" if adv else ""))
         self.refresh_res_list()
 
     # ---------- Browser actions ----------
     def refresh_res_list(self):
-        # Wipe and repopulate from file
         self.res_tree.delete(*self.res_tree.get_children())
-        # (Re)load file to reflect other users/processes
         self.state_data = load_state()
 
         q = (self.search_var.get() or "").strip().lower()
@@ -281,6 +413,14 @@ class ReservationApp(tk.Tk):
                 n = (ISO(r["depart"]) - ISO(r["arrive"])).days
             except Exception:
                 n = ""
+            
+            # Show payment status
+            paid_status = "Yes" if r.get("paid_advance", 0) > 0 or r.get("rtype") in ["Conventional", "Incentive"] else "No"
+            if r.get("rtype") == "60-Day" and r.get("paid_advance", 0) > 0:
+                paid_status = "Yes"
+
+            masked_card = mask_card(r.get("cc_info",""))
+            
             self.res_tree.insert(
                 "", "end", iid=r["locator"],
                 values=(
@@ -293,24 +433,49 @@ class ReservationApp(tk.Tk):
                     r.get("rtype",""),
                     r.get("status",""),
                     r.get("assigned_room",""),
+                    paid_status,
+                    masked_card
                 )
             )
 
     def on_select_res(self, _evt=None):
         sel = self.res_tree.selection()
-        if not sel: return
+        if not sel: 
+            self.selected_reservation = None
+            return
         loc = sel[0]
         rec = next((x for x in self.state_data["reservations"] if x.get("locator")==loc), None)
-        if not rec: return
-        # Fill details area
-        self.d_lbl.config(text=(
+        if not rec: 
+            self.selected_reservation = None
+            return
+        
+        self.selected_reservation = rec
+        
+        # Fill details area, including masked card
+        details_text = (
             f"Locator: {rec.get('locator','')}   |   Guest: {rec.get('guest_name','')}   |   "
             f"Arrive: {rec.get('arrive','')} → Depart: {rec.get('depart','')}   |   "
             f"Room Type: {rec.get('room_type','')}   |   Res Type: {rec.get('rtype','')}   |   "
-            f"Status: {rec.get('status','')}   |   Room#: {rec.get('assigned_room','')}"
-        ))
+            f"Status: {rec.get('status','')}   |   Room#: {rec.get('assigned_room','')}   |   "
+            f"Paid: ${rec.get('paid_advance',0):.2f}   |   Total: ${rec.get('total_locked',0):.2f}"
+        )
+        if rec.get('no_show_penalty', 0) > 0:
+            details_text += f"   |   No-Show Penalty: ${rec.get('no_show_penalty',0):.2f}"
+        if rec.get('fully_paid'):
+            details_text += "   |   Fully Paid"
+        masked_cc = mask_card(rec.get("cc_info", ""))
+        if masked_cc.strip() and masked_cc != "****":
+            details_text += f"   |   Card: {masked_cc}"
+            
+        self.d_lbl.config(text=details_text)
         self.d_status.set(rec.get("status","Booked"))
         self.d_room.set(rec.get("assigned_room",""))
+        
+        # Update date change box with current dates
+        self.curr_arr_label.config(text=rec.get("arrive","—"))
+        self.curr_dep_label.config(text=rec.get("depart","—"))
+        self.d_new_arr.set(rec.get("arrive",""))
+        self.d_new_dep.set(rec.get("depart",""))
 
     def update_selected(self):
         sel = self.res_tree.selection()
@@ -330,7 +495,302 @@ class ReservationApp(tk.Tk):
         self.refresh_res_list()
         messagebox.showinfo("Update", f"Reservation {loc} updated.")
 
+    # ---------- Date change ----------
+    def quote_date_change(self):
+        if not self.selected_reservation:
+            return messagebox.showwarning("Quote Date Change", "Select a reservation in the table.")
+        
+        rec = self.selected_reservation
+        new_arrive = self.d_new_arr.get().strip()
+        new_depart = self.d_new_dep.get().strip()
+        
+        if not new_arrive or not new_depart:
+            return messagebox.showwarning("Quote Date Change", "Please enter both new arrival and departure dates.")
+        
+        try:
+            original_cost = rec.get("total_locked", 0)
+            is_change = rec["rtype"] in ["Prepaid", "60-Day"]
+            total, nightly, eligible, occ, change_note = quote_total(
+                self.state_data, new_arrive, new_depart, rec["rtype"], 
+                original_cost, is_change=is_change
+            )
+            
+            nights = (ISO(new_depart) - ISO(new_arrive)).days
+            difference = total - original_cost
+            
+            message = (
+                f"Date Change Quote for {rec['locator']}:\n\n"
+                f"Old: {rec['arrive']} to {rec['depart']} = ${original_cost:,.2f}\n"
+                f"New: {new_arrive} to {new_depart} = ${total:,.2f}\n"
+                f"Additional Cost: ${difference:,.2f}\n"
+                f"Nights: {nights}\n"
+                f"Incentive eligible: {'Yes' if eligible else 'No'}\n"
+                f"Avg occupancy: {occ*100:.1f}%"
+            )
+            if is_change:
+                message += f"\n\n{change_note or 'Change policy applied.'}"
+            else:
+                message += "\n\nNo date-change penalty for this reservation type."
+            
+            messagebox.showinfo("Date Change Quote", message)
+            
+        except Exception as e:
+            messagebox.showerror("Quote Date Change Error", str(e))
+
+    def apply_date_change(self):
+        if not self.selected_reservation:
+            return messagebox.showwarning("Apply Date Change", "Select a reservation in the table.")
+        
+        rec = self.selected_reservation
+        new_arrive = self.d_new_arr.get().strip()
+        new_depart = self.d_new_dep.get().strip()
+        
+        if not new_arrive or not new_depart:
+            return messagebox.showwarning("Apply Date Change", "Please enter both new arrival and departure dates.")
+        
+        try:
+            if ISO(new_depart) <= ISO(new_arrive):
+                return messagebox.showerror("Date Error", "Departure must be after arrival.")
+            
+            original_cost = rec.get("total_locked", 0)
+            is_change = rec["rtype"] in ["Prepaid", "60-Day"]
+            total, nightly, eligible, occ, change_note = quote_total(
+                self.state_data, new_arrive, new_depart, rec["rtype"],
+                original_cost, is_change=is_change
+            )
+            
+            old_arrive, old_depart = rec["arrive"], rec["depart"]
+            rec["arrive"] = new_arrive
+            rec["depart"] = new_depart
+            rec["total_locked"] = round(total, 2)
+            rec["snapshot"] = {"nightly": nightly}
+            rec["change_note"] = change_note
+            
+            if rec["status"] == "Changing date":
+                rec["status"] = "Booked"
+                self.d_status.set("Booked")
+            
+            save_state(self.state_data)
+            self.curr_arr_label.config(text=new_arrive)
+            self.curr_dep_label.config(text=new_depart)
+            
+            message = (
+                f"Date change applied to {rec['locator']}:\n\n"
+                f"Old: {old_arrive} to {old_depart} (${original_cost:,.2f})\n"
+                f"New: {new_arrive} to {new_depart} (${total:,.2f})\n"
+                f"Additional cost: ${total - original_cost:,.2f}\n"
+                f"Status: {rec['status']}"
+            )
+            if change_note:
+                message += f"\n\nNotes: {change_note}"
+            
+            messagebox.showinfo("Date Change Applied", message)
+            self.refresh_res_list()
+            
+        except Exception as e:
+            messagebox.showerror("Apply Date Change Error", str(e))
+
+    # ---------- Payment and cancellation ----------
+    def process_prepayment(self):
+        if not self.selected_reservation:
+            return messagebox.showwarning("Payment", "Select a reservation in the table.")
+        
+        rec = self.selected_reservation
+        loc = rec["locator"]
+        
+        if rec.get("paid_advance", 0) >= rec.get("total_locked", 0):
+            return messagebox.showinfo("Payment", f"Reservation {loc} is already fully paid.")
+        
+        if rec["rtype"] in ["Conventional", "Incentive"]:
+            return messagebox.showinfo("Payment", f"{rec['rtype']} reservations are paid at checkout, not in advance.")
+        
+        amount = rec["total_locked"] - rec.get("paid_advance", 0)
+        
+        if messagebox.askyesno("Process Payment", 
+                             f"Process payment of ${amount:,.2f} for reservation {loc}?\n"
+                             f"Guest: {rec['guest_name']}"):
+            rec["paid_advance"] = rec["total_locked"]
+            rec["paid_advance_date"] = TODAY().isoformat()
+            rec["fully_paid"] = True
+            save_state(self.state_data)
+            self.refresh_res_list()
+            messagebox.showinfo("Payment Processed", f"Payment of ${amount:,.2f} processed for {loc}")
+
+    def process_payment(self):
+        """Process remaining payment for Conventional/Incentive or to mark fully paid."""
+        if not self.selected_reservation:
+            return messagebox.showwarning("Payment", "Select a reservation in the table.")
+        
+        rec = self.selected_reservation
+        loc = rec["locator"]
+        if rec.get("fully_paid"):
+            return messagebox.showinfo("Payment", f"Reservation {loc} is already fully paid.")
+        if rec.get("status") == "Cancelled":
+            return messagebox.showwarning("Payment", "Cannot process payment for a cancelled reservation.")
+        
+        amount_due = rec["total_locked"] - rec.get("paid_advance", 0)
+        if amount_due <= 0:
+            rec["fully_paid"] = True
+            save_state(self.state_data)
+            self.refresh_res_list()
+            return messagebox.showinfo("Payment", f"No amount due. Marked {loc} as fully paid.")
+        
+        if messagebox.askyesno("Process Payment", 
+                             f"Process payment of ${amount_due:,.2f} for reservation {loc}?\n"
+                             f"Guest: {rec['guest_name']}"):
+            rec["paid_advance"] = rec["total_locked"]
+            rec["paid_advance_date"] = TODAY().isoformat()
+            rec["fully_paid"] = True
+            save_state(self.state_data)
+            self.refresh_res_list()
+            messagebox.showinfo("Payment Processed", f"Payment of ${amount_due:,.2f} processed for {loc}")
+
+    def cancel_reservation(self):
+        if not self.selected_reservation:
+            return messagebox.showwarning("Cancellation", "Select a reservation in the table.")
+        
+        rec = self.selected_reservation
+        loc = rec["locator"]
+        rtype = rec["rtype"]
+        
+        if rec.get("status") == "Cancelled":
+            return messagebox.showinfo("Cancellation", "Reservation is already cancelled.")
+        if rec.get("checked_out"):
+            return messagebox.showwarning("Cancellation", "Cannot cancel checked-out reservation.")
+        
+        # Check cancellation policies
+        if rtype in ["Prepaid", "60-Day"]:
+            policy = "NO REFUND for cancellations"
+        else:
+            days_until_arrival = (ISO(rec["arrive"]) - TODAY()).days
+            if days_until_arrival < 3:
+                penalty_preview = list(rec.get('snapshot', {}).get('nightly', {}).values())[0] if rec.get('snapshot', {}).get('nightly') else base_rate(self.state_data, ISO(rec["arrive"]))
+                policy = f"Charge first night (${penalty_preview:.2f}) as penalty"
+            else:
+                policy = "No penalty"
+        
+        if messagebox.askyesno("Cancel Reservation", 
+                              f"Cancel reservation {loc}?\n"
+                              f"Guest: {rec['guest_name']}\n"
+                              f"Type: {rtype}\n"
+                              f"Policy: {policy}\n\n"
+                              f"Are you sure?"):
+            if rtype in ["Prepaid", "60-Day"]:
+                pass
+            elif rtype in ["Conventional", "Incentive"]:
+                days_until_arrival = (ISO(rec["arrive"]) - TODAY()).days
+                if days_until_arrival < 3:
+                    penalty = list(rec.get('snapshot', {}).get('nightly', {}).values())[0] if rec.get('snapshot', {}).get('nightly') else base_rate(self.state_data, ISO(rec["arrive"]))
+                    rec["no_show_penalty"] = penalty
+                    rec["paid_advance"] = penalty
+            
+            rec["status"] = "Cancelled"
+            rec["cancelled_date"] = TODAY().isoformat()
+            save_state(self.state_data)
+            self.refresh_res_list()
+            messagebox.showinfo("Cancelled", f"Reservation {loc} cancelled.\nPolicy applied: {policy}")
+
+    def check_in_guest(self):
+        if not self.selected_reservation:
+            return messagebox.showwarning("Check In", "Select a reservation in the table.")
+        
+        rec = self.selected_reservation
+        if rec["status"] == "In-House":
+            return messagebox.showinfo("Check In", "Guest is already checked in.")
+        if rec.get("status") == "Cancelled":
+            return messagebox.showwarning("Check In", "Cannot check in a cancelled reservation.")
+        if not rec.get("assigned_room"):
+            return messagebox.showwarning("Check In", "Please assign a room number first.")
+        
+        rec["status"] = "In-House"
+        rec["checked_in"] = True
+        rec["check_in_date"] = TODAY().isoformat()
+        save_state(self.state_data)
+        self.refresh_res_list()
+        messagebox.showinfo("Checked In", f"Guest {rec['guest_name']} checked into room {rec['assigned_room']}")
+
+    def check_out_guest(self):
+        if not self.selected_reservation:
+            return messagebox.showwarning("Check Out", "Select a reservation in the table.")
+        
+        rec = self.selected_reservation
+        if rec["status"] != "In-House":
+            return messagebox.showwarning("Check Out", "Guest is not checked in.")
+        
+        # Calculate final payment for Conventional and Incentive reservations
+        final_payment = 0
+        if rec["rtype"] in ["Conventional", "Incentive"]:
+            final_payment = rec["total_locked"] - rec.get("paid_advance", 0)
+        
+        message = f"Check out guest {rec['guest_name']} from room {rec['assigned_room']}?"
+        if final_payment > 0:
+            message += f"\n\nFinal payment due: ${final_payment:,.2f}"
+        
+        if messagebox.askyesno("Check Out", message):
+            rec["status"] = "Checked-out"
+            rec["checked_out"] = True
+            rec["check_out_date"] = TODAY().isoformat()
+            
+            if final_payment > 0:
+                rec["paid_advance"] = rec["total_locked"]  # Mark as fully paid
+                rec["fully_paid"] = True
+            
+            save_state(self.state_data)
+            self.refresh_res_list()
+            messagebox.showinfo("Checked Out", f"Guest {rec['guest_name']} checked out." + 
+                              (f"\nFinal payment of ${final_payment:,.2f} processed." if final_payment > 0 else ""))
+
+    def generate_bill(self):
+        """Generate a bill summary with clear math notes."""
+        if not self.selected_reservation:
+            return messagebox.showwarning("Bill", "Select a reservation in the table.")
+        rec = self.selected_reservation
+        loc = rec.get("locator","Unknown")
+        guest = rec.get("guest_name","")
+        arrive = rec.get("arrive","")
+        depart = rec.get("depart","")
+        nights = (ISO(depart) - ISO(arrive)).days if arrive and depart else 0
+
+        nightly_rates = rec.get("snapshot", {}).get("nightly", {})
+        total_locked = rec.get("total_locked", 0.0)
+        paid = rec.get("paid_advance", 0.0)
+        penalty = rec.get("no_show_penalty", 0.0)
+        change_note = rec.get("change_note", "")
+
+        notes = []
+        notes.append(f"Bill for reservation {loc} — Guest: {guest}")
+        notes.append(f"Stay: {arrive} → {depart} ({nights} nights)")
+        if nightly_rates:
+            notes.append("Nightly rates (locked):")
+            for d, amt in nightly_rates.items():
+                notes.append(f"  {d}: ${amt:,.2f}")
+        else:
+            notes.append("Nightly rates: not available")
+
+        notes.append(f"Subtotal (total locked): ${total_locked:,.2f}")
+        if change_note:
+            notes.append(f"Date change notes: {change_note}")
+        if penalty and rec.get("status") == "Cancelled":
+            notes.append(f"Cancellation penalty: ${penalty:,.2f}")
+        if paid:
+            notes.append(f"Advance/previous payments: ${paid:,.2f}")
+
+        balance = max(0.0, total_locked - paid) + (penalty or 0.0)
+        notes.append(f"Balance due: ${balance:,.2f}")
+
+        messagebox.showinfo("Generated Bill", "\n".join(notes))
+
+    def run_daily_tasks_ui(self):
+        """Run daily tasks and show results to user"""
+        tasks = run_daily_tasks(self.state_data)
+        if tasks:
+            messagebox.showinfo("Daily Tasks Completed", 
+                              "The following tasks were performed:\n\n• " + "\n• ".join(tasks))
+        else:
+            messagebox.showinfo("Daily Tasks", "No daily tasks needed to be performed.")
+        self.refresh_res_list()
+
 if __name__ == "__main__":
     app = ReservationApp()
-    app.geometry("980x560")
+    app.geometry("1000x750")  # Adjusted for layout
     app.mainloop()
