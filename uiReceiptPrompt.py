@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
 import json, os
-
+# the data file is "hrs_data"
 DATA_FILE = "hrs_data.json"
 
 # ---------------- Bill Model ----------------
