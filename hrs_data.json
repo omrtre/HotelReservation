@@ -52,8 +52,8 @@
       "rtype": "Conventional",
       "room_type": "Suite",
       "cc_on_file": true,
-      "paid_advance": 0.0,
-      "paid_advance_date": "",
+      "paid_advance": 900.0,
+      "paid_advance_date": "2025-11-25",
       "total_locked": 900.0,
       "snapshot": {
         "nightly": {
@@ -63,8 +63,16 @@
         }
       },
       "assigned_room": "",
-      "status": "In-House"
+      "status": "In-House",
+      "payments": [
+        {
+          "date": "2025-11-25",
+          "amount": 900.0
+        }
+      ],
+      "fully_paid": true
     }
   ],
-  "last_locator": 4002
+  "last_locator": 4002,
+  "payment_reminders_sent": {}
 }

@@ -1,0 +1,14 @@
+Ophelia's Oasis Hotel
+-------------------------
+Bill ID: OO4002
+Bill Issue Date: 2025-11-25
+Guest Name: t
+Room Number: 
+Arrival Date: 2025-11-24
+Departure Date: 2025-11-27
+Nights Stayed: 3
+Reservation Type: Conventional
+Total Amount: $900.00
+Paid: $900.00
+Balance: $0.00
+-------------------------
