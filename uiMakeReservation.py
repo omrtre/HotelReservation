@@ -53,7 +53,7 @@ def next_locator(state):
 class ReservationApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Ophelia's Oasis — Reservation App (Staff makes a reservation)")
+        self.title("Hotel Reservation System — Reservation")
         self.state_data = load_state()
 
         if not self.state_data["base_rates"]:
