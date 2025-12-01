@@ -3,7 +3,7 @@ import json, os, datetime as dt, re
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-# --------- Constants ---------
+# --------- Constants --------- NO additional work needed.
 DATA_FILE, ROOM_COUNT = "hrs_data.json", 45
 TODAY = dt.date.today
 ISO = dt.date.fromisoformat
